@@ -1,0 +1,726 @@
+// (c) Howard Nguyen - RELAY VN Equity Swing v1.1
+// Viet Nam stock market pattern relay engine.
+// Built for HOSE/HNX/UPCOM Daily and Weekly swing trading.
+// Lifecycle: formation -> armed -> fired.
+// Notes:
+// - Bullish FIRED = possible long setup.
+// - Bearish FIRED = risk-off / reduce exposure alert in VN cash market mode.
+// - Backtest before live use. This is an educational indicator, not advice.
+
+//@version=6
+indicator("[ Howard Nguyen ] RELAY VN - Equity Swing Engine", shorttitle="HN RELAY VN",
+  overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=80, max_bars_back=800)
+
+// =============================================================================
+//  SCANNER ENGINE
+// =============================================================================
+grpScan = "Scanner Engine"
+pivLen         = input.int(13, "Pivot Length", minval=5, maxval=35, group=grpScan,
+  tooltip="Swing sensitivity. For VN stocks, 12-18 works well on Daily charts.")
+maxPivots      = input.int(180, "Max Pivots Stored", minval=50, maxval=500, group=grpScan)
+symTol         = input.float(6.0, "Level Symmetry (%)", minval=1.0, step=0.5, group=grpScan) / 100
+minFormPct     = input.float(60.0, "Min Formation % to Show", minval=40.0, maxval=90.0, step=5.0, group=grpScan)
+armedAtr       = input.float(0.45, "ARMED Zone (xATR from neck)", minval=0.1, maxval=2.0, step=0.05, group=grpScan)
+atrLen         = input.int(20, "ATR Length", minval=5, maxval=100, group=grpScan)
+
+grpPat = "Pattern Types"
+enDouble       = input.bool(true, "Double Top / Bottom", group=grpPat)
+enHs           = input.bool(true, "Head & Shoulders / Inv H&S", group=grpPat)
+enTriangle     = input.bool(true, "Triangles (Asc / Desc / Sym)", group=grpPat)
+enFlag         = input.bool(true, "Flags & Pennants", group=grpPat)
+enWedge        = input.bool(true, "Rising / Falling Wedge", group=grpPat)
+
+// =============================================================================
+//  VIET NAM MARKET LAYER
+// =============================================================================
+grpVN = "Viet Nam Stock Market Layer"
+tradeMode      = input.string("VN Cash: long only + risk alerts", "Trading Mode",
+  options=["VN Cash: long only + risk alerts", "Long signals only", "Allow shorts (derivatives only)"], group=grpVN,
+  tooltip="Vietnam cash equities do not support short selling. Bearish setups are risk alerts unless shorts are explicitly enabled.")
+allowShorts    = tradeMode == "Allow shorts (derivatives only)"
+showBearRisk   = tradeMode == "VN Cash: long only + risk alerts" or allowShorts
+cashLongOnly   = not allowShorts
+exchangeBand   = input.string("Auto", "Daily Price Band",
+  options=["Auto", "HOSE +/-7%", "HNX +/-10%", "UPCOM +/-15%", "Custom"], group=grpVN)
+customBandPct  = input.float(7.0, "Custom Price Band (%)", minval=1.0, maxval=30.0, step=0.5, group=grpVN) / 100
+blockLimitFire = input.bool(true, "Block FIRED on near ceiling/floor bars", group=grpVN)
+limitHitRatio  = input.float(0.92, "Near Limit Threshold", minval=0.70, maxval=1.00, step=0.01, group=grpVN,
+  tooltip="0.92 means a daily move reaching 92% of the exchange band is treated as near ceiling/floor.")
+
+useLiquidity   = input.bool(true, "Liquidity Filter", group=grpVN)
+liqLen         = input.int(20, "Liquidity SMA Length", minval=5, maxval=100, group=grpVN)
+minAvgValueB   = input.float(5.0, "Min Avg Value (B VND)", minval=0.0, step=0.5, group=grpVN)
+valuePriceMult = input.float(1.0, "Price Multiplier for Value", minval=0.001, step=0.001, group=grpVN,
+  tooltip="Use 1 if chart price is VND. Use 1000 if chart price is displayed in thousand VND.")
+
+useGapFilter   = input.bool(true, "Gap Filter", group=grpVN)
+maxGapPct      = input.float(4.0, "Max Opening Gap (%)", minval=0.5, maxval=20.0, step=0.5, group=grpVN) / 100
+
+useMarket      = input.bool(true, "VNINDEX / Market Regime Filter", group=grpVN)
+marketSymbol   = input.symbol("HOSE:VNINDEX", "Market Index Symbol", group=grpVN)
+marketTf       = input.timeframe("W", "Market Regime Timeframe", group=grpVN)
+marketFast     = input.int(10, "Market Fast EMA", minval=3, maxval=50, group=grpVN)
+marketSlow     = input.int(30, "Market Slow EMA", minval=10, maxval=100, group=grpVN)
+requireMarketFire = input.bool(false, "Hard Block Counter-Market FIRED", group=grpVN)
+
+// =============================================================================
+//  BREAKOUT & QUALITY
+// =============================================================================
+grpQual = "Howard Nguyen Quality Layer"
+minConf        = input.int(6, "Min Confluence (of 10)", minval=3, maxval=10, group=grpQual)
+useHtf         = input.bool(true, "Stock HTF Bias Layer", group=grpQual)
+htfTf          = input.timeframe("W", "Stock HTF Timeframe", group=grpQual)
+htfFast        = input.int(10, "Stock HTF Fast EMA", minval=3, maxval=100, group=grpQual)
+htfSlow        = input.int(30, "Stock HTF Slow EMA", minval=10, maxval=200, group=grpQual)
+requireHtfFire = input.bool(false, "Hard Block Counter-Stock-HTF FIRED", group=grpQual)
+
+useChop        = input.bool(true, "Block Extreme Chop", group=grpQual)
+chopLen        = input.int(20, "Choppiness Length", minval=5, maxval=80, group=grpQual)
+chopMax        = input.float(60.0, "Chop Block Above", minval=45, maxval=80, step=0.5, group=grpQual)
+
+useVolCoil     = input.bool(true, "Reward Volume Coil Before Break", group=grpQual)
+volLen         = input.int(20, "Volume SMA Length", minval=5, maxval=100, group=grpQual)
+volCoilMax     = input.float(0.85, "Max Vol vs Avg (coil)", minval=0.4, maxval=1.2, step=0.05, group=grpQual)
+useBreakVol    = input.bool(true, "Require Volume Expansion on FIRED", group=grpQual)
+firedVolMin    = input.float(1.35, "Min FIRED Vol vs Avg", minval=0.8, maxval=3.0, step=0.05, group=grpQual)
+
+brkAtr         = input.float(0.8, "FIRED Break Margin (xATR)", minval=0.1, maxval=3.0, step=0.1, group=grpQual)
+minRR          = input.float(2.0, "Min R:R at FIRED", minval=0.5, maxval=6.0, step=0.1, group=grpQual)
+cooldown       = input.int(12, "Signal Cooldown (bars)", minval=1, maxval=80, group=grpQual)
+
+// =============================================================================
+//  TARGETS & DISPLAY
+// =============================================================================
+grpVis = "Targets & Display"
+showFormBox    = input.bool(true, "Show Formation Box", group=grpVis)
+showNeck       = input.bool(true, "Show Neckline / Boundary", group=grpVis)
+showPhaseLbl   = input.bool(true, "Show Phase Labels", group=grpVis)
+showFiredLvls  = input.bool(true, "Show FIRED Levels / Risk Line", group=grpVis)
+expireFiredBars = input.int(6, "Expire FIRED After Bars", minval=1, maxval=100, group=grpVis,
+  tooltip="After this many bars, FIRED trade levels are cleared from the dashboard to avoid stale entries.")
+useEntryGuard  = input.bool(true, "Expire if price is far from ENTRY", group=grpVis)
+maxEntryDrift  = input.float(8.0, "Max ENTRY Drift (%)", minval=1.0, maxval=50.0, step=0.5, group=grpVis) / 100
+tp1Pct         = input.float(50.0, "TP1 (% of Entry to TP2)", minval=10.0, maxval=90.0, step=5.0, group=grpVis) / 100
+slPctTgt       = input.float(25.0, "SL % of Target Distance", minval=5.0, maxval=50.0, step=5.0, group=grpVis) / 100
+showDash       = input.bool(true, "Show Dashboard", group=grpVis)
+dashPos        = input.string("Top Right", "Dashboard Position",
+  options=["Top Left", "Top Right", "Bottom Left", "Bottom Right"], group=grpVis)
+
+grpColors = "Colors"
+colBull        = input.color(#1b8f3a, "Bull", group=grpColors)
+colBullBr      = input.color(#29c75f, "Bull Bright", group=grpColors)
+colBear        = input.color(#d82034, "Bear", group=grpColors)
+colBearBr      = input.color(#ff4d5d, "Bear Bright", group=grpColors)
+colForm        = input.color(#4f6bdc, "FORMING", group=grpColors)
+colArmed       = input.color(#f59e0b, "ARMED", group=grpColors)
+colFired       = input.color(#29c75f, "FIRED", group=grpColors)
+colNeutral     = input.color(#6b7280, "Neutral", group=grpColors)
+colSlLine      = input.color(#d82034, "Stop", group=grpColors)
+colTp1Line     = input.color(#65a30d, "TP1", group=grpColors)
+colTp2Line     = input.color(#16a34a, "TP2", group=grpColors)
+colTextLt      = input.color(#e5e7eb, "Dash Text", group=grpColors)
+colDashBg      = input.color(#111827, "Dash BG", group=grpColors)
+colDashHeader  = input.color(#0b1220, "Dash Header", group=grpColors)
+colDashSec     = input.color(#1f2937, "Dash Section", group=grpColors)
+colDashFrame   = input.color(#29c75f, "Dash Frame", group=grpColors)
+
+grpAlrt = "Alerts"
+alertEn        = input.bool(true, "JSON Alerts on FIRED", group=grpAlrt)
+
+// =============================================================================
+//  TYPES
+// =============================================================================
+type Pivot
+    float p
+    int   i
+
+type RelaySetup
+    bool   active
+    string name
+    string phase
+    bool   isBull
+    float  completion
+    float  neck
+    float  height
+    float  entry
+    float  stop
+    float  tp2
+    int    startBar
+    int    endBar
+    int    conf
+
+type DrawBundle
+    line[]  lns
+    label[] lbls
+    box[]   boxes
+
+// =============================================================================
+//  STATE
+// =============================================================================
+var RelaySetup EMPTY = RelaySetup.new(false, "", "", false, 0, na, na, na, na, na, na, na, 0)
+var array<Pivot> pivH = array.new<Pivot>()
+var array<Pivot> pivL = array.new<Pivot>()
+var array<DrawBundle> history = array.new<DrawBundle>()
+
+var string dName = "-"
+var string dPhase = "IDLE"
+var bool   dBull = false
+var float  dComp = 0.0
+var float  dNeck = na
+var float  dEntry = na
+var float  dStop = na
+var float  dTp1 = na
+var float  dTp2 = na
+var int    dConf = 0
+var int    dLastBar = 0
+
+// =============================================================================
+//  CORE SERIES
+// =============================================================================
+atrVal = ta.atr(atrLen)
+volMa  = ta.sma(volume, volLen)
+volRatio = volMa > 0 ? volume / volMa : 0.0
+
+float ciSum = math.sum(ta.atr(1), chopLen)
+float ciHl  = ta.highest(high, chopLen) - ta.lowest(low, chopLen)
+float chopIdx = ciHl > 0 ? 100.0 * math.log10(ciSum / ciHl) / math.log10(chopLen) : 50.0
+bool chopOk = not useChop or chopIdx < chopMax
+
+f_autoBand() =>
+    str.contains(syminfo.tickerid, "UPCOM:") ? 0.15 :
+      str.contains(syminfo.tickerid, "HNX:") ? 0.10 : 0.07
+
+float limitBand =
+  switch exchangeBand
+    "HOSE +/-7%"   => 0.07
+    "HNX +/-10%"   => 0.10
+    "UPCOM +/-15%" => 0.15
+    "Custom"       => customBandPct
+    => f_autoBand()
+
+float gapPct = not na(close[1]) and close[1] > 0 ? math.abs(open - close[1]) / close[1] : 0.0
+float dayMovePct = not na(close[1]) and close[1] > 0 ? math.abs(close - close[1]) / close[1] : 0.0
+bool nearLimitBar = dayMovePct >= limitBand * limitHitRatio
+bool limitOk = not blockLimitFire or not nearLimitBar
+bool gapOk = not useGapFilter or gapPct <= maxGapPct
+
+float tradeValue = volume * close * valuePriceMult
+float avgValue = ta.sma(tradeValue, liqLen)
+bool liqOk = not useLiquidity or avgValue >= minAvgValueB * 1000000000.0
+
+htfClose = request.security(syminfo.tickerid, htfTf, close, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+htfFastE = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfFast), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+htfSlowE = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfSlow), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+htfBull  = htfFastE > htfSlowE and htfClose > htfFastE
+htfBear  = htfFastE < htfSlowE and htfClose < htfFastE
+
+marketClose = request.security(marketSymbol, marketTf, close, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+marketFastE = request.security(marketSymbol, marketTf, ta.ema(close, marketFast), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+marketSlowE = request.security(marketSymbol, marketTf, ta.ema(close, marketSlow), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+marketValid = not na(marketClose) and not na(marketFastE) and not na(marketSlowE)
+marketBull  = marketValid and marketFastE > marketSlowE and marketClose > marketFastE
+marketBear  = marketValid and marketFastE < marketSlowE and marketClose < marketFastE
+
+getDashPos(p) =>
+    switch p
+        "Top Left"     => position.top_left
+        "Top Right"    => position.top_right
+        "Bottom Left"  => position.bottom_left
+        => position.bottom_right
+
+f_near(float a, float b) =>
+    math.abs(a - b) <= (a + b) * 0.5 * symTol
+
+f_proj(float x1, float y1, float x2, float y2, int x) =>
+    x2 == x1 ? y1 : y1 + (y2 - y1) / (x2 - x1) * (x - x1)
+
+f_rr(float ep, float sl, float tp) =>
+    math.abs(ep - sl) > 0 ? math.abs(tp - ep) / math.abs(ep - sl) : 0.0
+
+f_tp1(float ep, float tp2, bool bull) =>
+    float d = math.abs(tp2 - ep)
+    bull ? ep + d * tp1Pct : ep - d * tp1Pct
+
+f_biasText(bool bull) =>
+    bull ? "long" : allowShorts ? "short" : "risk_off"
+
+f_levelTitle(bool bull) =>
+    bull ? "ENTRY" : allowShorts ? "SHORT ENTRY" : "RISK LEVEL"
+
+f_phaseColor(string ph) =>
+    ph == "FIRED" ? colFired : ph == "ARMED" ? colArmed : ph == "EXPIRED" ? colNeutral : colForm
+
+f_conf(RelaySetup s) =>
+    if not s.active
+        0
+    else
+        int sc = 0
+        sc += s.completion >= 85 ? 2 : s.completion >= minFormPct ? 1 : 0
+        sc += useHtf ? (s.isBull and htfBull ? 2 : not s.isBull and htfBear ? 2 : 0) : 1
+        sc += useMarket ? (marketValid ? (s.isBull and marketBull ? 2 : not s.isBull and marketBear ? 2 : 0) : 1) : 1
+        sc += chopOk ? 1 : 0
+        sc += liqOk ? 1 : 0
+        sc += gapOk ? 1 : 0
+        sc += s.phase == "FIRED" ? 2 : s.phase == "ARMED" ? 1 : 0
+        sc += s.phase == "FIRED" ? (useBreakVol and volRatio >= firedVolMin ? 2 : useBreakVol ? 0 : 1) :
+          (useVolCoil and volMa > 0 and volume <= volMa * volCoilMax ? 1 : 0)
+        sc += f_rr(s.entry, s.stop, s.tp2) >= minRR ? 1 : 0
+        sc += s.height >= atrVal * 2.0 ? 1 : 0
+        sc -= s.phase == "FIRED" and blockLimitFire and nearLimitBar ? 2 : 0
+        math.max(0, math.min(sc, 10))
+
+f_clearDrawings() =>
+    for b in history
+        for ln in b.lns
+            if not na(ln)
+                line.delete(ln)
+        for lb in b.lbls
+            if not na(lb)
+                label.delete(lb)
+        for bx in b.boxes
+            if not na(bx)
+                box.delete(bx)
+    array.clear(history)
+
+// =============================================================================
+//  PIVOT COLLECTION
+// =============================================================================
+float ph = ta.pivothigh(high, pivLen, pivLen)
+float pl = ta.pivotlow(low, pivLen, pivLen)
+if not na(ph)
+    pivH.unshift(Pivot.new(ph, bar_index - pivLen))
+    if pivH.size() > maxPivots
+        pivH.pop()
+if not na(pl)
+    pivL.unshift(Pivot.new(pl, bar_index - pivLen))
+    if pivL.size() > maxPivots
+        pivL.pop()
+
+// =============================================================================
+//  FORMATION SCANNERS
+// =============================================================================
+detectDoubleForm() =>
+    RelaySetup s = EMPTY
+    if pivH.size() >= 2 and pivL.size() >= 1 and enDouble
+        Pivot p1 = pivH.get(0)
+        Pivot p2 = pivH.get(1)
+        Pivot mid = pivL.get(0)
+        if p1.i > mid.i and mid.i > p2.i and f_near(p1.p, p2.p)
+            float neck = mid.p
+            float h = (p1.p + p2.p) * 0.5 - neck
+            if h > atrVal
+                float comp = 70.0
+                comp += close < neck ? 15.0 : 0.0
+                comp += math.abs(close - neck) <= atrVal * armedAtr ? 15.0 : 0.0
+                bool fired = close < neck - atrVal * brkAtr
+                string pstate = fired ? "FIRED" : math.abs(close - neck) <= atrVal * armedAtr ? "ARMED" : "FORMING"
+                float ep = close
+                float tp2 = neck - h
+                float sl = ep + math.abs(tp2 - ep) * slPctTgt
+                s := RelaySetup.new(true, "Double Top", pstate, false, comp, neck, h, ep, sl, tp2, p2.i, bar_index, 0)
+    if not s.active and pivL.size() >= 2 and pivH.size() >= 1 and enDouble
+        Pivot p1 = pivL.get(0)
+        Pivot p2 = pivL.get(1)
+        Pivot mid = pivH.get(0)
+        if p1.i > mid.i and mid.i > p2.i and f_near(p1.p, p2.p)
+            float neck = mid.p
+            float h = neck - (p1.p + p2.p) * 0.5
+            if h > atrVal
+                float comp = 70.0
+                comp += close > neck ? 15.0 : 0.0
+                comp += math.abs(close - neck) <= atrVal * armedAtr ? 15.0 : 0.0
+                bool fired = close > neck + atrVal * brkAtr
+                string pstate = fired ? "FIRED" : math.abs(close - neck) <= atrVal * armedAtr ? "ARMED" : "FORMING"
+                float ep = close
+                float tp2 = neck + h
+                float sl = ep - math.abs(tp2 - ep) * slPctTgt
+                s := RelaySetup.new(true, "Double Bottom", pstate, true, comp, neck, h, ep, sl, tp2, p2.i, bar_index, 0)
+    s
+
+detectHsForm() =>
+    RelaySetup s = EMPTY
+    if pivH.size() >= 3 and pivL.size() >= 2 and enHs
+        Pivot rs = pivH.get(0)
+        Pivot head = pivH.get(1)
+        Pivot ls = pivH.get(2)
+        Pivot nl = pivL.get(1)
+        Pivot nr = pivL.get(0)
+        if head.p > rs.p and head.p > ls.p and f_near(rs.p, ls.p)
+            float neck = f_proj(nl.i, nl.p, nr.i, nr.p, bar_index)
+            float h = head.p - (nl.p + nr.p) * 0.5
+            if h > atrVal
+                float comp = 65.0
+                comp += close < neck ? 12.0 : 0.0
+                comp += math.abs(close - neck) <= atrVal * armedAtr ? 18.0 : 0.0
+                string pstate = close < neck - atrVal * brkAtr ? "FIRED" : math.abs(close - neck) <= atrVal * armedAtr ? "ARMED" : "FORMING"
+                float ep = close
+                float tp2 = neck - h
+                float sl = ep + math.abs(tp2 - ep) * slPctTgt
+                s := RelaySetup.new(true, "Head & Shoulders", pstate, false, comp, neck, h, ep, sl, tp2, ls.i, bar_index, 0)
+    if not s.active and pivL.size() >= 3 and pivH.size() >= 2 and enHs
+        Pivot rs = pivL.get(0)
+        Pivot head = pivL.get(1)
+        Pivot ls = pivL.get(2)
+        Pivot nh = pivH.get(1)
+        Pivot rh = pivH.get(0)
+        if head.p < rs.p and head.p < ls.p and f_near(rs.p, ls.p)
+            float neck = f_proj(nh.i, nh.p, rh.i, rh.p, bar_index)
+            float h = (nh.p + rh.p) * 0.5 - head.p
+            if h > atrVal
+                float comp = 65.0
+                comp += close > neck ? 12.0 : 0.0
+                comp += math.abs(close - neck) <= atrVal * armedAtr ? 18.0 : 0.0
+                string pstate = close > neck + atrVal * brkAtr ? "FIRED" : math.abs(close - neck) <= atrVal * armedAtr ? "ARMED" : "FORMING"
+                float ep = close
+                float tp2 = neck + h
+                float sl = ep - math.abs(tp2 - ep) * slPctTgt
+                s := RelaySetup.new(true, "Inv H&S", pstate, true, comp, neck, h, ep, sl, tp2, ls.i, bar_index, 0)
+    s
+
+detectTriangleForm() =>
+    RelaySetup s = EMPTY
+    if pivH.size() >= 2 and pivL.size() >= 2 and enTriangle
+        Pivot h1 = pivH.get(0)
+        Pivot h2 = pivH.get(1)
+        Pivot l1 = pivL.get(0)
+        Pivot l2 = pivL.get(1)
+        float uNow = f_proj(h2.i, h2.p, h1.i, h1.p, bar_index)
+        float lNow = f_proj(l2.i, l2.p, l1.i, l1.p, bar_index)
+        float base = math.abs(f_proj(h2.i, h2.p, h1.i, h1.p, l2.i) - f_proj(l2.i, l2.p, l1.i, l1.p, l2.i))
+        bool conv = uNow > lNow and base > atrVal
+        if conv
+            float su = (h1.p - h2.p) / math.max(1, h1.i - h2.i)
+            float slp = (l1.p - l2.p) / math.max(1, l1.i - l2.i)
+            bool asc = math.abs(su) < close * 0.0003 and slp > 0
+            bool desc = su < 0 and math.abs(slp) < close * 0.0003
+            bool bullBreak = close > uNow + atrVal * brkAtr
+            bool bearBreak = close < lNow - atrVal * brkAtr
+            if bullBreak or (not bearBreak and (asc or su < 0))
+                float comp = 60.0 + (base / atrVal > 2 ? 15 : 5)
+                comp += math.abs(close - uNow) <= atrVal * armedAtr ? 15.0 : 0.0
+                string pstate = bullBreak ? "FIRED" : math.abs(close - uNow) <= atrVal * armedAtr ? "ARMED" : "FORMING"
+                float ep = close
+                float tp2 = uNow + base
+                float stop = lNow
+                string nm = asc ? "Asc Triangle" : "Sym Triangle"
+                s := RelaySetup.new(true, nm, pstate, true, comp, uNow, base, ep, stop, tp2, l2.i, bar_index, 0)
+            else if bearBreak or desc
+                float comp = 60.0 + (base / atrVal > 2 ? 15 : 5)
+                comp += math.abs(close - lNow) <= atrVal * armedAtr ? 15.0 : 0.0
+                string pstate = bearBreak ? "FIRED" : math.abs(close - lNow) <= atrVal * armedAtr ? "ARMED" : "FORMING"
+                float ep = close
+                float tp2 = lNow - base
+                float stop = uNow
+                string nm = desc ? "Desc Triangle" : "Sym Triangle"
+                s := RelaySetup.new(true, nm, pstate, false, comp, lNow, base, ep, stop, tp2, l2.i, bar_index, 0)
+    s
+
+detectFlagForm() =>
+    RelaySetup s = EMPTY
+    if pivH.size() >= 2 and pivL.size() >= 2 and enFlag
+        Pivot h1 = pivH.get(0)
+        Pivot h2 = pivH.get(1)
+        Pivot l1 = pivL.get(0)
+        Pivot l2 = pivL.get(1)
+        int sb = math.min(h2.i, l2.i)
+        int span = bar_index - sb + 1
+        float pole = span > 5 ? ta.highest(high, math.min(span, 160)) - ta.lowest(low, math.min(span, 160)) : 0.0
+        float su = (h1.p - h2.p) / math.max(1, h1.i - h2.i)
+        float slo = (l1.p - l2.p) / math.max(1, l1.i - l2.i)
+        if pole > atrVal * 3.0
+            if su < 0 and slo < 0
+                float uB = f_proj(h2.i, h2.p, h1.i, h1.p, bar_index)
+                float comp = 62.0
+                comp += math.abs(close - uB) <= atrVal * armedAtr ? 20.0 : 0.0
+                bool fired = close > uB + atrVal * brkAtr
+                string pstate = fired ? "FIRED" : math.abs(close - uB) <= atrVal * armedAtr ? "ARMED" : "FORMING"
+                float ep = close
+                float tp2 = uB + pole
+                float stop = f_proj(l2.i, l2.p, l1.i, l1.p, bar_index)
+                s := RelaySetup.new(true, "Bull Flag", pstate, true, comp, uB, pole, ep, stop, tp2, sb, bar_index, 0)
+            else if su > 0 and slo > 0
+                float lB = f_proj(l2.i, l2.p, l1.i, l1.p, bar_index)
+                float comp = 62.0
+                comp += math.abs(close - lB) <= atrVal * armedAtr ? 20.0 : 0.0
+                bool fired = close < lB - atrVal * brkAtr
+                string pstate = fired ? "FIRED" : math.abs(close - lB) <= atrVal * armedAtr ? "ARMED" : "FORMING"
+                float ep = close
+                float tp2 = lB - pole
+                float stop = f_proj(h2.i, h2.p, h1.i, h1.p, bar_index)
+                s := RelaySetup.new(true, "Bear Flag", pstate, false, comp, lB, pole, ep, stop, tp2, sb, bar_index, 0)
+    s
+
+detectWedgeForm() =>
+    RelaySetup s = EMPTY
+    if pivH.size() >= 2 and pivL.size() >= 2 and enWedge
+        Pivot h1 = pivH.get(0)
+        Pivot h2 = pivH.get(1)
+        Pivot l1 = pivL.get(0)
+        Pivot l2 = pivL.get(1)
+        float su = (h1.p - h2.p) / math.max(1, h1.i - h2.i)
+        float slo = (l1.p - l2.p) / math.max(1, l1.i - l2.i)
+        float uB = f_proj(h2.i, h2.p, h1.i, h1.p, bar_index)
+        float lB = f_proj(l2.i, l2.p, l1.i, l1.p, bar_index)
+        if uB > lB
+            if su < 0 and slo < 0 and slo < su
+                float comp = 58.0 + math.min(20.0, (uB - lB) / atrVal * 5)
+                bool fired = close > uB + atrVal * brkAtr
+                string pstate = fired ? "FIRED" : math.abs(close - uB) <= atrVal * armedAtr ? "ARMED" : "FORMING"
+                float ep = close
+                float tp2 = h2.p
+                float stop = lB
+                s := RelaySetup.new(true, "Falling Wedge", pstate, true, comp, uB, uB - lB, ep, stop, tp2, l2.i, bar_index, 0)
+            else if su > 0 and slo > 0 and slo > su
+                float comp = 58.0 + math.min(20.0, (uB - lB) / atrVal * 5)
+                bool fired = close < lB - atrVal * brkAtr
+                string pstate = fired ? "FIRED" : math.abs(close - lB) <= atrVal * armedAtr ? "ARMED" : "FORMING"
+                float ep = close
+                float tp2 = l2.p
+                float stop = uB
+                s := RelaySetup.new(true, "Rising Wedge", pstate, false, comp, lB, uB - lB, ep, stop, tp2, l2.i, bar_index, 0)
+    s
+
+f_pickBest(RelaySetup a, RelaySetup b) =>
+    if not b.active
+        a
+    else if not a.active
+        b
+    else
+        float sa = f_conf(a) + a.completion * 0.05 + (a.phase == "FIRED" ? 3 : a.phase == "ARMED" ? 2 : 0)
+        float sb = f_conf(b) + b.completion * 0.05 + (b.phase == "FIRED" ? 3 : b.phase == "ARMED" ? 2 : 0)
+        sb > sa ? b : a
+
+// =============================================================================
+//  ENGINE
+// =============================================================================
+RelaySetup cand = EMPTY
+bool baseOk = chopOk and liqOk and gapOk
+if bar_index > 250 and baseOk and pivH.size() >= 2 and pivL.size() >= 2
+    cand := f_pickBest(cand, detectDoubleForm())
+    cand := f_pickBest(cand, detectHsForm())
+    cand := f_pickBest(cand, detectTriangleForm())
+    cand := f_pickBest(cand, detectFlagForm())
+    cand := f_pickBest(cand, detectWedgeForm())
+
+if cand.active and cand.completion < minFormPct
+    cand := EMPTY
+if cand.active and cashLongOnly and not showBearRisk and not cand.isBull
+    cand := EMPTY
+if cand.active and cand.phase == "FIRED" and blockLimitFire and not limitOk
+    cand := EMPTY
+if cand.active and cand.phase == "FIRED" and useBreakVol and volRatio < firedVolMin
+    cand := EMPTY
+if cand.active and cand.phase == "FIRED" and requireHtfFire
+    if cand.isBull and not htfBull
+        cand := EMPTY
+    if not cand.isBull and not htfBear
+        cand := EMPTY
+if cand.active and cand.phase == "FIRED" and requireMarketFire and marketValid
+    if cand.isBull and not marketBull
+        cand := EMPTY
+    if not cand.isBull and not marketBear
+        cand := EMPTY
+if cand.active and cand.phase == "FIRED" and f_rr(cand.entry, cand.stop, cand.tp2) < minRR
+    cand := EMPTY
+int candConf = f_conf(cand)
+if cand.active and candConf < minConf
+    cand := EMPTY
+
+var int lastFireBar = na
+var string lastKey = ""
+string candKey = cand.active ? cand.name + cand.phase + str.tostring(cand.startBar) : ""
+bool newEvent = cand.active and barstate.isconfirmed and candKey != lastKey and (na(lastFireBar) or bar_index - lastFireBar >= cooldown)
+
+if newEvent
+    lastKey := candKey
+    if cand.phase == "FIRED"
+        lastFireBar := bar_index
+
+    f_clearDrawings()
+    DrawBundle db = DrawBundle.new(array.new_line(), array.new_label(), array.new_box())
+    bool tradeLevelsOk = cand.isBull or allowShorts
+
+    dName := cand.name
+    dPhase := cand.phase
+    dBull := cand.isBull
+    dComp := cand.completion
+    dNeck := cand.neck
+    dEntry := cand.phase == "FIRED" ? (tradeLevelsOk ? cand.entry : cand.neck) : na
+    dStop := cand.phase == "FIRED" and tradeLevelsOk ? cand.stop : na
+    dTp2 := cand.phase == "FIRED" and tradeLevelsOk ? cand.tp2 : na
+    dTp1 := cand.phase == "FIRED" and tradeLevelsOk ? f_tp1(cand.entry, cand.tp2, cand.isBull) : na
+    dConf := candConf
+    dLastBar := bar_index
+
+    color pc = f_phaseColor(cand.phase)
+    color bc = cand.isBull ? colBull : colBear
+    color entryCol = cand.isBull ? colBullBr : colBearBr
+
+    if showFormBox
+        box bx = box.new(cand.startBar, cand.isBull ? cand.neck : cand.neck + cand.height,
+          cand.endBar, cand.isBull ? cand.neck + cand.height : cand.neck,
+          border_color=color.new(pc, 40), bgcolor=color.new(pc, 88))
+        array.push(db.boxes, bx)
+
+    if showNeck
+        line ln = line.new(cand.startBar, cand.neck, cand.endBar + 30, cand.neck,
+          color=color.new(pc, 0), width=2, style=line.style_solid)
+        array.push(db.lns, ln)
+
+    if showPhaseLbl
+        string lblTxt = cand.name + "\n" + cand.phase + " " + str.tostring(cand.completion, "#") + "%"
+        label lb = label.new(cand.endBar, cand.neck, lblTxt,
+          color=color.new(colDashBg, 10), textcolor=pc,
+          style=cand.isBull ? label.style_label_up : label.style_label_down, size=size.small)
+        array.push(db.lbls, lb)
+
+    if showFiredLvls and cand.phase == "FIRED"
+        int x1 = bar_index
+        int x2 = bar_index + 50
+        int lx = x2 + 1
+        if tradeLevelsOk
+            float tp1v = f_tp1(cand.entry, cand.tp2, cand.isBull)
+            line le = line.new(x1, cand.entry, x2, cand.entry, color=entryCol, style=line.style_dashed)
+            line ls = line.new(x1, cand.stop, x2, cand.stop, color=colSlLine, style=line.style_dashed)
+            line l1 = line.new(x1, tp1v, x2, tp1v, color=colTp1Line, style=line.style_dotted)
+            line l2 = line.new(x1, cand.tp2, x2, cand.tp2, color=colTp2Line, style=line.style_dashed, width=2)
+            array.push(db.lns, le)
+            array.push(db.lns, ls)
+            array.push(db.lns, l1)
+            array.push(db.lns, l2)
+            label lbe = label.new(lx, cand.entry, f_levelTitle(cand.isBull) + " " + str.tostring(cand.entry, format.mintick),
+              style=label.style_label_left, color=color.new(colDashBg, 25), textcolor=entryCol, size=size.tiny)
+            label lbs = label.new(lx, cand.stop, "SL " + str.tostring(cand.stop, format.mintick),
+              style=label.style_label_left, color=color.new(colDashBg, 25), textcolor=colSlLine, size=size.tiny)
+            label lb1 = label.new(lx, tp1v, "TP1 " + str.tostring(tp1v, format.mintick),
+              style=label.style_label_left, color=color.new(colDashBg, 25), textcolor=colTp1Line, size=size.tiny)
+            label lb2 = label.new(lx, cand.tp2, "TP2 " + str.tostring(cand.tp2, format.mintick) + "  R:R " + str.tostring(f_rr(cand.entry, cand.stop, cand.tp2), "#.##"),
+              style=label.style_label_left, color=color.new(colDashBg, 25), textcolor=colTp2Line, size=size.tiny)
+            array.push(db.lbls, lbe)
+            array.push(db.lbls, lbs)
+            array.push(db.lbls, lb1)
+            array.push(db.lbls, lb2)
+        else
+            line lr = line.new(x1, cand.neck, x2, cand.neck, color=colBearBr, style=line.style_dashed, width=2)
+            array.push(db.lns, lr)
+            label lbr = label.new(lx, cand.neck, "RISK LEVEL " + str.tostring(cand.neck, format.mintick),
+              style=label.style_label_left, color=color.new(colDashBg, 25), textcolor=colBearBr, size=size.tiny)
+            array.push(db.lbls, lbr)
+
+    if alertEn and cand.phase == "FIRED"
+        string js = '{"source":"Howard Nguyen RELAY VN","phase":"FIRED","pattern":"' + cand.name +
+             '","bias":"' + f_biasText(cand.isBull) +
+             '","completion":' + str.tostring(cand.completion)
+        if tradeLevelsOk
+            float tp1vAlert = f_tp1(cand.entry, cand.tp2, cand.isBull)
+            js := js + ',"entry":' + str.tostring(cand.entry, format.mintick) +
+              ',"tp1":' + str.tostring(tp1vAlert, format.mintick) +
+              ',"tp2":' + str.tostring(cand.tp2, format.mintick) +
+              ',"sl":' + str.tostring(cand.stop, format.mintick)
+        else
+            js := js + ',"riskLevel":' + str.tostring(cand.neck, format.mintick)
+        js := js + ',"confluence":' + str.tostring(candConf) +
+          ',"avgValueB":' + str.tostring(avgValue / 1000000000.0, "#.##") +
+          ',"volRatio":' + str.tostring(volRatio, "#.##") + '}'
+        alert(js, alert.freq_once_per_bar_close)
+
+    array.push(history, db)
+
+int dAge = dLastBar > 0 ? bar_index - dLastBar : 0
+bool dTradeLevel = dPhase == "FIRED" and (dBull or allowShorts)
+bool expiredByAge = dPhase == "FIRED" and dAge > expireFiredBars
+bool expiredByDistance = dTradeLevel and useEntryGuard and not na(dEntry) and math.abs(dEntry) > 0 and math.abs(close - dEntry) / math.abs(dEntry) > maxEntryDrift
+bool expiredByStop = dTradeLevel and not na(dStop) and ((dBull and close < dStop) or (not dBull and close > dStop))
+
+if expiredByAge or expiredByDistance or expiredByStop
+    f_clearDrawings()
+    dPhase := "EXPIRED"
+    dEntry := na
+    dStop := na
+    dTp1 := na
+    dTp2 := na
+    dConf := 0
+
+// =============================================================================
+//  DASHBOARD
+// =============================================================================
+var table dash = table.new(getDashPos(dashPos), 2, 16,
+  border_width=1, border_color=color.new(colDashFrame, 60),
+  frame_width=1, frame_color=color.new(colDashFrame, 40))
+
+if showDash and barstate.islast
+    color dbg = color.new(colDashBg, 0)
+    color sec = color.new(colDashSec, 0)
+    color phCol = f_phaseColor(dPhase)
+    string mTxt = marketBull ? "MKT BULL" : marketBear ? "MKT BEAR" : marketValid ? "MKT FLAT" : "MKT N/A"
+    string hTxt = htfBull ? "HTF BULL" : htfBear ? "HTF BEAR" : "HTF FLAT"
+    string liqTxt = str.tostring(avgValue / 1000000000.0, "#.##") + "B"
+    string vnTxt = (liqOk ? "LIQ OK" : "LOW LIQ") + " / " + (gapOk ? "GAP OK" : "GAP") + " / " + (nearLimitBar ? "LIMIT" : "NORMAL")
+    string levelTitle = dPhase == "IDLE" ? "LEVEL" : f_levelTitle(dBull)
+
+    table.cell(dash, 0, 0, "Howard Nguyen RELAY VN", text_color=colBullBr, text_size=size.normal,
+      bgcolor=color.new(colDashHeader, 0), text_halign=text.align_center)
+    table.cell(dash, 1, 0, syminfo.ticker + " / " + timeframe.period,
+      text_color=color.new(colBullBr, 20), text_size=size.tiny, bgcolor=color.new(colDashHeader, 0), text_halign=text.align_center)
+
+    table.cell(dash, 0, 1, "--- RELAY STATE ---", text_color=color.new(colNeutral, 10), text_size=size.tiny, bgcolor=sec, text_halign=text.align_center)
+    table.cell(dash, 1, 1, "", bgcolor=sec)
+
+    table.cell(dash, 0, 2, "PATTERN", text_color=colTextLt, text_size=size.small, bgcolor=dbg)
+    table.cell(dash, 1, 2, dName, text_color=dBull ? colBullBr : colBearBr, text_size=size.small, bgcolor=dbg)
+
+    table.cell(dash, 0, 3, "PHASE", text_color=colTextLt, text_size=size.small, bgcolor=dbg)
+    table.cell(dash, 1, 3, dPhase, text_color=phCol, text_size=size.small, bgcolor=dbg)
+
+    table.cell(dash, 0, 4, "FORMATION", text_color=colTextLt, text_size=size.small, bgcolor=dbg)
+    table.cell(dash, 1, 4, str.tostring(dComp, "#") + "%", text_color=dComp >= 80 ? colBullBr : colArmed, text_size=size.small, bgcolor=dbg)
+
+    table.cell(dash, 0, 5, "NECKLINE", text_color=colTextLt, text_size=size.small, bgcolor=dbg)
+    table.cell(dash, 1, 5, not na(dNeck) ? str.tostring(dNeck, format.mintick) : "-", text_color=colTextLt, text_size=size.small, bgcolor=dbg)
+
+    table.cell(dash, 0, 6, "--- LEVELS (FIRED) ---", text_color=color.new(colNeutral, 10), text_size=size.tiny, bgcolor=sec, text_halign=text.align_center)
+    table.cell(dash, 1, 6, "", bgcolor=sec)
+
+    table.cell(dash, 0, 7, levelTitle, text_color=colTextLt, text_size=size.small, bgcolor=dbg)
+    table.cell(dash, 1, 7, not na(dEntry) ? str.tostring(dEntry, format.mintick) : "-", text_color=not na(dEntry) ? (dBull ? colBullBr : colBearBr) : colNeutral, text_size=size.small, bgcolor=dbg)
+
+    table.cell(dash, 0, 8, "TP1 / TP2", text_color=colTextLt, text_size=size.small, bgcolor=dbg)
+    table.cell(dash, 1, 8, not na(dTp1) ? str.tostring(dTp1, format.mintick) + " / " + str.tostring(dTp2, format.mintick) : "-",
+      text_color=colTp2Line, text_size=size.small, bgcolor=dbg)
+
+    table.cell(dash, 0, 9, "STOP", text_color=colTextLt, text_size=size.small, bgcolor=dbg)
+    table.cell(dash, 1, 9, not na(dStop) ? str.tostring(dStop, format.mintick) : "-", text_color=colSlLine, text_size=size.small, bgcolor=dbg)
+
+    table.cell(dash, 0, 10, "--- QUALITY ---", text_color=color.new(colNeutral, 10), text_size=size.tiny, bgcolor=sec, text_halign=text.align_center)
+    table.cell(dash, 1, 10, "", bgcolor=sec)
+
+    table.cell(dash, 0, 11, "CONFLUENCE", text_color=colTextLt, text_size=size.small, bgcolor=dbg)
+    table.cell(dash, 1, 11, str.tostring(dConf) + " / 10", text_color=dConf >= minConf ? colBullBr : colNeutral, text_size=size.small, bgcolor=dbg)
+
+    table.cell(dash, 0, 12, "HTF / MARKET", text_color=colTextLt, text_size=size.small, bgcolor=dbg)
+    table.cell(dash, 1, 12, hTxt + " / " + mTxt, text_color=colTextLt, text_size=size.tiny, bgcolor=dbg)
+
+    table.cell(dash, 0, 13, "VN FILTERS", text_color=colTextLt, text_size=size.small, bgcolor=dbg)
+    table.cell(dash, 1, 13, vnTxt, text_color=baseOk and limitOk ? colTextLt : colArmed, text_size=size.tiny, bgcolor=dbg)
+
+    table.cell(dash, 0, 14, "VALUE / VOL", text_color=colTextLt, text_size=size.small, bgcolor=dbg)
+    table.cell(dash, 1, 14, liqTxt + " / " + str.tostring(volRatio, "#.##") + "x", text_color=liqOk ? colTextLt : colArmed, text_size=size.small, bgcolor=dbg)
+
+    table.cell(dash, 0, 15, "GAP / BAND", text_color=colTextLt, text_size=size.small, bgcolor=dbg)
+    table.cell(dash, 1, 15, str.tostring(gapPct * 100, "#.##") + "% / " + str.tostring(limitBand * 100, "#.#") + "%", text_color=limitOk and gapOk ? colTextLt : colArmed, text_size=size.small, bgcolor=dbg)
+
+// =============================================================================
+//  ALERTS
+// =============================================================================
+alertcondition(newEvent and cand.phase == "ARMED" and cand.isBull, title="HN RELAY VN ARMED Long",
+  message="[Howard Nguyen RELAY VN] ARMED bullish formation on {{ticker}} {{interval}}.")
+alertcondition(newEvent and cand.phase == "ARMED" and not cand.isBull and not allowShorts, title="HN RELAY VN ARMED Risk",
+  message="[Howard Nguyen RELAY VN] ARMED bearish risk formation on {{ticker}} {{interval}}.")
+alertcondition(newEvent and cand.phase == "ARMED" and not cand.isBull and allowShorts, title="HN RELAY VN ARMED Short",
+  message="[Howard Nguyen RELAY VN] ARMED bearish short formation on {{ticker}} {{interval}}.")
+alertcondition(newEvent and cand.phase == "FIRED" and cand.isBull, title="HN RELAY VN FIRED Long",
+  message="[Howard Nguyen RELAY VN] FIRED bullish breakout on {{ticker}} {{interval}}.")
+alertcondition(newEvent and cand.phase == "FIRED" and not cand.isBull and not allowShorts, title="HN RELAY VN FIRED Risk",
+  message="[Howard Nguyen RELAY VN] FIRED bearish risk breakdown on {{ticker}} {{interval}}.")
+alertcondition(newEvent and cand.phase == "FIRED" and not cand.isBull and allowShorts, title="HN RELAY VN FIRED Short",
+  message="[Howard Nguyen RELAY VN] FIRED bearish short breakdown on {{ticker}} {{interval}}.")
